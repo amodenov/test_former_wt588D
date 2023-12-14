@@ -1,0 +1,57 @@
+  TRACK 25 AUDIO
+    TITLE "Тон 10Гц, -10db"
+    PERFORMER "AV"
+    INDEX 01 39:01:32
+  TRACK 26 AUDIO
+    TITLE "Тон 20Гц, -10db"
+    PERFORMER "AV"
+    INDEX 01 39:21:34
+  TRACK 27 AUDIO
+    TITLE "Тон 40Гц, -10db"
+    PERFORMER "AV"
+    INDEX 01 39:41:40
+  TRACK 28 AUDIO
+    TITLE "Тон 80Гц, -10db"
+    PERFORMER "AV"
+    INDEX 01 40:01:41
+  TRACK 29 AUDIO
+    TITLE "Тон 160Гц, -10db"
+    PERFORMER "AV"
+    INDEX 01 40:21:55
+  TRACK 30 AUDIO
+    TITLE "Тон 315Гц, -10db"
+    PERFORMER "AV"
+    INDEX 01 40:42:03
+  TRACK 31 AUDIO
+    TITLE "Тон 1кГц, -10db"
+    PERFORMER "AV"
+    INDEX 01 41:02:36
+  TRACK 32 AUDIO
+    TITLE "Тон 3.15кГц, -10db"
+    PERFORMER "AV"
+    INDEX 01 41:22:58
+  TRACK 33 AUDIO
+    TITLE "Тон 6.3кГц, -10db"
+    PERFORMER "AV"
+    INDEX 01 41:42:74
+  TRACK 34 AUDIO
+    TITLE "Тон 10кГц, -10db"
+    PERFORMER "AV"
+    INDEX 01 42:03:37
+  TRACK 35 AUDIO
+    TITLE "Тон 12.5кГц, -10db"
+    PERFORMER "AV"
+    INDEX 01 42:23:67
+  TRACK 36 AUDIO
+    TITLE "Тон 16кГц, -10db"
+    PERFORMER "AV"
+    INDEX 01 42:44:00
+  TRACK 37 AUDIO
+    TITLE "Тон 18кГц, -10db"
+    PERFORMER "AV"
+    INDEX 01 43:04:22
+  TRACK 38 AUDIO
+    TITLE "Тон 20кГц, -10db"
+    PERFORMER "AV"
+    INDEX 01 43:24:39
+
