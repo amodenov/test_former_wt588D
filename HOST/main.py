@@ -265,6 +265,7 @@ menu_entries = {
     'S': 'Start selected sound program',
     'F': 'Finish playing sound',
     'V': 'Change volume',
+    'L': 'Loop play',
     'P': 'Prepare serial port',
     'Q': 'Exit'
 }
@@ -377,6 +378,14 @@ def main():
                     continue
                 else:
                     print('stop play command sent OK')
+            if 'L' == action_string :
+                cmdbuffer[1] = 0;
+                cmdbuffer[0] = 'L'.encode('UTF-8')[0]
+                if not sendRecord(cmdbuffer) :
+                    print('problem sending loop play command')
+                    continue
+                else:
+                    print('loop play command sent OK')
             if 'E' == action_string :
                 # send erase whole chip command
                 cmdbuffer[1] = 0
