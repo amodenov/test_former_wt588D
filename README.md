@@ -8,4 +8,6 @@ Initial version
 
     ATmega88PA  -> SPI          |   -> WT588D-16P
                 -> Discrete I/O |
-    
+ 
+
+  Initial support for output control    
