@@ -3,6 +3,50 @@
 #include <crc_lib.h>
 /*
  */
+# define DEFAULT_QUEUE_LENGTH 8
+struct FixedAverageBuffer {
+ public:  
+  void FillBuffer(uint32_t valb = 0) {
+    for(int i = 0; i < DEFAULT_QUEUE_LENGTH; ++i)
+      avgbuffer[i] = valb;
+  }
+  int Init(void) {
+    int rtv = 0;
+    avglen = DEFAULT_QUEUE_LENGTH;
+    avgsum = 0;
+    avgptr = 0;
+    avgpoints = 0;
+    FillBuffer();
+    return rtv;
+  }
+  uint16_t getValue(void) {
+    return (uint16_t)(avgsum/avgpoints);
+  }
+  void putValue(uint16_t val) {
+    if (avglen > avgpoints) {
+      avgsum += (uint32_t)val;
+      avgbuffer[avgptr] = val;
+      ++avgpoints;
+      ++avgptr;
+    } else {
+      if (avglen <= avgptr)
+        avgptr = 0;
+      avgsum -= (uint32_t)avgbuffer[avgptr];
+      avgbuffer[avgptr] = val;
+      avgsum += (uint32_t) val;
+      ++avgptr;
+    }
+  }
+  
+ public:
+  byte avgptr;
+  uint32_t avgsum;
+  byte avgpoints;
+  uint16_t avgbuffer[DEFAULT_QUEUE_LENGTH];
+  byte avglen;
+};
+/*
+ */
 /*
   The ICSP connector on MEGA256 is being used
   ICSP connector  (Arduino) WT588D-16P
@@ -38,6 +82,9 @@
   25 PIN_PC2       |   15 (BUSY)
 
   WT5688D-16P pin 14 (Vcc) to 3.3 V
+
+   6 PIN_PD4       |   MCP41011 (CS)
+  28 PIN_PC5       |   MCP41011 (U/D)
  */
 #define ATMEGA88PA 
 
@@ -58,6 +105,11 @@
 # define MODULE_BUSY_LED PIN_PD2
 # define OPERATION_STATUS PIN_PB1
 
+# define MCP41011_CS PIN_PD4
+# define MCP41011_UD PIN_PC5
+# define MCP41011_OUT PIN_PC4
+# define cs PIN_PD4
+# define ud PIN_PC5
 #endif
 /*
  */
@@ -79,10 +131,15 @@
 #define MEM_CHIP_ERASE 0x60
 #define MEM_READ_IDENTIFICATION_ID 0x9F
 #define MEM_READ_DEVICE_ID 0x90  // read manufacturer code and device ID
-                                 /* WT588D one line commands
-                                  */
+/* WT588D one line commands
+ */
 #define WT588_STOP_PLAY 0xFE
 /* select and start play program - 00 .. 0xDB */
+#define WT588_LOOP_PLAY 0xF2
+/*
+ */
+#define BITWEIGHT 31 /* ADC bit weight in millivolts */
+#define MILLIVOLT_TENTH 10000
 /*
  */
 static uint8_t test_data_block[DATA_BLOCK_SIZE + 2];
@@ -117,6 +174,12 @@ void setup() {
   SPI.setDataMode(SPI_MODE0);
   SPI.setClockDivider(SPI_CLOCK_DIV16);
 
+  /* */
+  pinMode(MCP41011_CS, OUTPUT);
+  digitalWrite(MCP41011_CS, HIGH);
+  pinMode(MCP41011_UD, OUTPUT);
+  digitalWrite(MCP41011_UD, LOW);
+  pinMode(MCP41011_OUT, INPUT);
 }
 void MemorySetAddress(uint32_t devaddr) {
   union {
@@ -146,7 +209,7 @@ uint8_t ReadStatusRegister(void) {
 void WriteStatusRegister(uint8_t newstate) {
   digitalWrite(MEM_CS, LOW);
   SPI.transfer(MEM_WRITE_STATUS_REGISTER);
-  SPI.transfer(0x00);
+  SPI.transfer(newstate);
   asm volatile("nop");
   digitalWrite(MEM_CS, HIGH);
 }
@@ -424,22 +487,79 @@ bool SendRecord(uint8_t* buffer) {
 }
 /*
  */
+// void MCP41011_DN(uint8_t steps) {
+//   digitalWrite(MCP41011_UD, HIGH);
+//   delayMicroseconds(1);
+//   digitalWrite(MCP41011_CS, LOW);
+//   delayMicroseconds(1);
+//   for(uint8_t i = 0;i < steps; ++i) {
+//     digitalWrite(MCP41011_UD, LOW);
+//     delayMicroseconds(2);
+//     digitalWrite(MCP41011_UD, HIGH); // value should be incremented
+//     delayMicroseconds(1);
+//   }
+//   digitalWrite(MCP41011_CS, HIGH);
+//   delayMicroseconds(1);
+//   digitalWrite(MCP41011_UD, LOW);
+// }
+
+// void MCP41011_UP(uint8_t steps) {
+//   digitalWrite(MCP41011_UD, LOW);
+//   delayMicroseconds(1);
+//   digitalWrite(MCP41011_CS, LOW);
+//   delayMicroseconds(1);
+//   for(uint8_t i = 0; i < steps; ++i) {
+//     digitalWrite(MCP41011_UD, HIGH);
+//     delayMicroseconds(1);
+//     digitalWrite(MCP41011_UD, LOW);
+//     delayMicroseconds(1);
+//   }
+//   digitalWrite(MCP41011_CS, HIGH);
+// }
+/*
+ */
+# define TIMESTEP 200
+# define POINTS_TO_BUFFER DEFAULT_QUEUE_LENGTH
+FixedAverageBuffer test_output;
 static bool isFirstEntry = true;
-static unsigned long t0 = 0;
-static uint8_t testled = 0;
 static uint8_t datablock[DATA_BLOCK_SIZE];
 
 static uint16_t non_empty_blocks = 0;
 static uint16_t total_blocks_to_read = 0;
 static uint16_t blocks_to_write = 0;
 static uint16_t write_from_block = 0;
-
-void loop() {
+//static uint8_t resistor_tap_value = 0x80;
+static uint16_t adcvalue = 0;
+static unsigned long time_interval_left = 0;
+static uint8_t points_counter = POINTS_TO_BUFFER;
+void loop() {  
   if (isFirstEntry) {
+    test_output.Init();
     isFirstEntry = false;
     delay(400);
     //
+    SPI.end();
+    pinMode(MEM_CS, INPUT);
+    /* */
+    pinMode(PIN_PB5, INPUT);
+    pinMode(PIN_PB3, INPUT);
+    /* */
+    delay(50);
+    SendSingleLineCommand(3, true);
+    SendSingleLineCommand(0xE7);
+    SendSingleLineCommand(0xF2);
+    //
+# if 0     
+    digitalWrite(MCP41011_CS, LOW);
+    delayMicroseconds(1);
+    SPI.transfer16(0x1100+resistor_tap_value);
+    delayMicroseconds(1);
+    digitalWrite(MCP41011_CS, HIGH);
+# endif    
+    time_interval_left = millis();
   }
+  /*
+   */
   #if 0
   while(1) {
     digitalWrite(MODULE_BUSY_LED, HIGH);
@@ -470,7 +590,7 @@ void loop() {
           digitalWrite(MODULE_RESET, LOW);
           //
           total_blocks_to_read = (datablock[2] & 0xFF) + ((datablock[3] << 8) & 0xFF00);
-          for (int i = 0; i < total_blocks_to_read; ++i) {
+          for (uint16_t i = 0; i < total_blocks_to_read; ++i) {
             MemoryReadDataBlock(i, datablock);
             SendRecord(datablock);
           }
@@ -489,7 +609,7 @@ void loop() {
           // get number of blocks to write and starting block number
           write_from_block = (datablock[2] & 0xFF) + ((datablock[3] << 8) & 0xFF00);
           blocks_to_write = (datablock[4] & 0xFF) + ((datablock[5] << 8) & 0xFF00);
-          for (int i = 0; i < blocks_to_write; ++i) {
+          for (uint16_t i = 0; i < blocks_to_write; ++i) {
             if (ReceiveRecord(datablock)) {
               uint8_t sts = (uint8_t)MemoryProgramPage(i + write_from_block, datablock);
               datablock[0] = sts + 0x30;
@@ -517,8 +637,76 @@ void loop() {
         case 'V' : // set volume level
           SendSingleLineCommand(0xE0 + datablock[2]);
         break;
+        case 'L' : // set loop play
+          SendSingleLineCommand(0xF2);
+        break;
       }
     }
+  } else {
+    Serial.flush();
   }
+  //
   digitalWrite(MODULE_BUSY_LED, digitalRead(MODULE_BUSY));
+  /*
+   */
+#if 0
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    Serial.print("MCP command : "); Serial.print(cmd);
+    switch(cmd) {
+      case 'U' :
+        Serial.println("MCP UP");
+        //MCP41011_UP(1);
+        if (255 > resistor_tap_value) {
+          ++resistor_tap_value;
+          Serial.println(resistor_tap_value);
+          digitalWrite(MCP41011_CS, LOW);
+          delayMicroseconds(1);
+          SPI.transfer16(0x1100+resistor_tap_value);
+          delayMicroseconds(1);
+          digitalWrite(MCP41011_CS, HIGH);
+        }
+        else
+         {Serial.print("Taps : "); Serial.println(resistor_tap_value);}
+        break;
+      case 'D' :
+        Serial.println("MCP down");
+        //MCP41011_DN(1);
+        if (1 <= resistor_tap_value) {
+          --resistor_tap_value;
+          Serial.println(resistor_tap_value);
+          digitalWrite(MCP41011_CS, LOW);
+          delayMicroseconds(1);
+          SPI.transfer16(0x1100+resistor_tap_value);
+          delayMicroseconds(1);
+          digitalWrite(MCP41011_CS, HIGH);
+        }
+        else
+         {Serial.print("Taps : "); Serial.println(resistor_tap_value);}
+        break;
+    }
+  }
+#endif
+  /* read voltage and convert to volts
+   */
+  if (TIMESTEP <= (abs(millis() - time_interval_left))) {
+    time_interval_left = millis();
+    adcvalue = analogRead(MCP41011_OUT);
+    test_output.putValue(adcvalue);
+    if (0 == points_counter) {
+      points_counter = POINTS_TO_BUFFER;
+      adcvalue = test_output.getValue();
+      adcvalue *= BITWEIGHT;
+      uint16_t volts = adcvalue / MILLIVOLT_TENTH;
+      uint16_t decimal = adcvalue % MILLIVOLT_TENTH;
+      Serial.print("MCP : "); Serial.print(volts);
+      sprintf((char*)datablock, "%04d", decimal);
+      Serial.print("."); Serial.println((char*)datablock);
+    }
+    --points_counter;
+  }
+/*
+ */
+/*
+ */  
 }
