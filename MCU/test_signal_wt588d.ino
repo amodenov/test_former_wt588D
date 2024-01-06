@@ -1,7 +1,15 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <crc_lib.h>
+#ifdef DISPLAY_TM1637
+#   include <GyverTM1637.h>
+#endif
+#include <LiquidCrystal_I2C.h>
 /*
+ *  The code supports WT588D programming capabilities and 
+ *  test signal device code
+ *    programming capabilities controlled by  #define WITH_PROGRAMMING_POSSIBILITIES
+ *    undefine to disable the programming capabilities
  */
 # define DEFAULT_QUEUE_LENGTH 8
 struct FixedAverageBuffer {
@@ -83,8 +91,8 @@ struct FixedAverageBuffer {
 
   WT5688D-16P pin 14 (Vcc) to 3.3 V
 
-   6 PIN_PD4       |   MCP41011 (CS)
-  28 PIN_PC5       |   MCP41011 (U/D)
+   6 PIN_PD4       |   MCP4011 (CS)
+  28 PIN_PC5       |   MCP4011 (U/D)
  */
 #define ATMEGA88PA 
 
@@ -105,11 +113,15 @@ struct FixedAverageBuffer {
 # define MODULE_BUSY_LED PIN_PD2
 # define OPERATION_STATUS PIN_PB1
 
-# define MCP41011_CS PIN_PD4
-# define MCP41011_UD PIN_PC5
-# define MCP41011_OUT PIN_PC4
-# define cs PIN_PD4
-# define ud PIN_PC5
+# define MCP4011_CS PIN_PB1
+# define MCP4011_UD PIN_PB2
+# define MONITOR PIN_PC0
+# define cs PIN_PB1
+# define ud PIN_PB2
+// device control buttons
+# define PARAM_SELECT PIN_PD3   // PCINT19 
+# define VALUE_UP     PIN_PD4   // PCINT20
+# define VALUE_DN     PIN_PD5   // PCINT21
 #endif
 /*
  */
@@ -136,16 +148,56 @@ struct FixedAverageBuffer {
 #define WT588_STOP_PLAY 0xFE
 /* select and start play program - 00 .. 0xDB */
 #define WT588_LOOP_PLAY 0xF2
+/* set volume as WT588_ZERO_VOLUME+N, where N=0..7
+ */
+#define WT588_ZERO_VOLUME 0xE0
 /*
  */
 #define BITWEIGHT 31 /* ADC bit weight in millivolts */
 #define MILLIVOLT_TENTH 10000
+/* */
+#ifdef DISPLAY_TM1637
+/*
+ * For 7 segment display controlled by 1637 chip
+ */
+GyverTM1637 disp(PIN_PC4, PIN_PC5);
+#endif
+LiquidCrystal_I2C lcd(0x27,16,2);
+/*
+ */
+//#    define WITH_PROGRAMMING_POSSIBILITIES
 /*
  */
 static uint8_t test_data_block[DATA_BLOCK_SIZE + 2];
 
 bool SendRecord(uint8_t*);
 /*
+ *
+ */
+ISR(TIMER0_COMPA_vect) {
+
+}
+/*
+ */
+ISR(TIMER1_OVF_vect) {
+
+}
+/*
+  */
+ISR(PCINT2_vect) {
+  // determine source button
+  if (0 != (PIND & _BV(PARAM_SELECT))) {
+    // process parameter selection button      
+  }
+  if (0 != (PIND & _BV(VALUE_UP))) {
+    // process value up button
+  }
+  if (0 != (PIND & _BV(VALUE_DN))) {
+    // process value dn
+  }
+}
+/*
+ *
  */
 void setup() {
   pinMode(MODULE_RESET, OUTPUT);
@@ -154,8 +206,10 @@ void setup() {
   
   while (!Serial)
     ;  // wait for serial monitor to open
+#ifdef WITH_PROGRAMMING_POSSIBILITIES    
   pinMode(MEM_CS, OUTPUT);
   digitalWrite(MEM_CS, HIGH);  // disable memory chip access
+#endif  
   pinMode(MODULE_DATA, OUTPUT);
   digitalWrite(MODULE_DATA, HIGH);
   pinMode(MODULE_BUSY, INPUT);
@@ -175,12 +229,34 @@ void setup() {
   SPI.setClockDivider(SPI_CLOCK_DIV16);
 
   /* */
-  pinMode(MCP41011_CS, OUTPUT);
-  digitalWrite(MCP41011_CS, HIGH);
-  pinMode(MCP41011_UD, OUTPUT);
-  digitalWrite(MCP41011_UD, LOW);
-  pinMode(MCP41011_OUT, INPUT);
+  pinMode(MCP4011_CS, OUTPUT);
+  digitalWrite(MCP4011_CS, HIGH);
+  pinMode(MCP4011_UD, OUTPUT);
+  digitalWrite(MCP4011_UD, LOW);
+  pinMode(MONITOR, INPUT);
+  /*
+   */
+#ifdef DISPLAY_TM1637
+  disp.clear();
+  disp.brightness(2);
+  disp.clear();
+  disp.displayByte(_S | 0b10000000, _A, _7, _8);
+#endif
+  lcd.init();        
+  lcd.init();        
+  lcd.backlight();// Включаем подсветку дисплея
+  lcd.setCursor(1, 0);
+  lcd.print("Sample: 100 Hz");
+  lcd.setCursor(9, 1);
+  lcd.print("180 mV");
+  /* Prepare for button interrupts
+   */
+  PCICR |= 4;       // enable PCINT[16-23] interrupts
+  PCMSK2 |= _BV(PCINT19) | _BV(PCINT20) | _BV(PCINT21);   // unmask PCINT19, PCINT20, PCINT21 --- button interrupts
 }
+
+#ifdef WITH_PROGRAMMING_POSSIBILITIES
+
 void MemorySetAddress(uint32_t devaddr) {
   union {
     uint32_t val;
@@ -204,14 +280,6 @@ uint8_t ReadStatusRegister(void) {
   asm volatile("nop");
   digitalWrite(MEM_CS, HIGH);
   return status;
-}
-
-void WriteStatusRegister(uint8_t newstate) {
-  digitalWrite(MEM_CS, LOW);
-  SPI.transfer(MEM_WRITE_STATUS_REGISTER);
-  SPI.transfer(newstate);
-  asm volatile("nop");
-  digitalWrite(MEM_CS, HIGH);
 }
 
 void MemoryReadDataBlock(uint16_t blockaddress, uint8_t* block_buffer) {
@@ -270,20 +338,6 @@ void MemorySetWriteEnable(uint8_t action) {
   digitalWrite(MEM_CS, HIGH);
 }
 
-void MemorySectorErase(uint16_t sectornumber) {
-  uint32_t devaddr = sectornumber << 12;
-  MemorySetWriteEnable(1);
-  digitalWrite(MEM_CS, LOW);
-  SPI.transfer(MEM_SECTOR_ERASE);
-  MemorySetAddress(devaddr);
-  asm volatile("nop");
-  digitalWrite(MEM_CS, HIGH);
-  while (3 & ReadStatusRegister()) {
-    delay(10);
-  }
-  MemorySetWriteEnable(0);
-}
-
 void MemoryChipErase(void) {
   MemorySetWriteEnable(1);
   digitalWrite(MEM_CS, LOW);
@@ -340,6 +394,8 @@ bool MemoryProgramPage(uint16_t blockaddress, const uint8_t* datablock) {
   }
   return is_problem;
 }
+
+#endif // ifdef   WITH_PROGRAMMING_POSSIBILITIES
 /*
  *  Send single line command
  */
@@ -487,35 +543,35 @@ bool SendRecord(uint8_t* buffer) {
 }
 /*
  */
-// void MCP41011_DN(uint8_t steps) {
-//   digitalWrite(MCP41011_UD, HIGH);
-//   delayMicroseconds(1);
-//   digitalWrite(MCP41011_CS, LOW);
-//   delayMicroseconds(1);
-//   for(uint8_t i = 0;i < steps; ++i) {
-//     digitalWrite(MCP41011_UD, LOW);
-//     delayMicroseconds(2);
-//     digitalWrite(MCP41011_UD, HIGH); // value should be incremented
-//     delayMicroseconds(1);
-//   }
-//   digitalWrite(MCP41011_CS, HIGH);
-//   delayMicroseconds(1);
-//   digitalWrite(MCP41011_UD, LOW);
-// }
+void MCP4011_DN(uint8_t steps) {
+  digitalWrite(MCP4011_UD, HIGH);
+  delayMicroseconds(1);
+  digitalWrite(MCP4011_CS, LOW);
+  delayMicroseconds(1);
+  for(uint8_t i = 0;i < steps; ++i) {
+    digitalWrite(MCP4011_UD, LOW);
+    delayMicroseconds(2);
+    digitalWrite(MCP4011_UD, HIGH); // value should be incremented
+    delayMicroseconds(1);
+  }
+  digitalWrite(MCP4011_CS, HIGH);
+  delayMicroseconds(1);
+  digitalWrite(MCP4011_UD, LOW);
+}
 
-// void MCP41011_UP(uint8_t steps) {
-//   digitalWrite(MCP41011_UD, LOW);
-//   delayMicroseconds(1);
-//   digitalWrite(MCP41011_CS, LOW);
-//   delayMicroseconds(1);
-//   for(uint8_t i = 0; i < steps; ++i) {
-//     digitalWrite(MCP41011_UD, HIGH);
-//     delayMicroseconds(1);
-//     digitalWrite(MCP41011_UD, LOW);
-//     delayMicroseconds(1);
-//   }
-//   digitalWrite(MCP41011_CS, HIGH);
-// }
+void MCP4011_UP(uint8_t steps) {
+  digitalWrite(MCP4011_UD, LOW);
+  delayMicroseconds(1);
+  digitalWrite(MCP4011_CS, LOW);
+  delayMicroseconds(1);
+  for(uint8_t i = 0; i < steps; ++i) {
+    digitalWrite(MCP4011_UD, HIGH);
+    delayMicroseconds(1);
+    digitalWrite(MCP4011_UD, LOW);
+    delayMicroseconds(1);
+  }
+  digitalWrite(MCP4011_CS, HIGH);
+}
 /*
  */
 # define TIMESTEP 200
@@ -524,11 +580,12 @@ FixedAverageBuffer test_output;
 static bool isFirstEntry = true;
 static uint8_t datablock[DATA_BLOCK_SIZE];
 
+#ifdef WITH_PROGRAMMING_POSSIBILITIES
 static uint16_t non_empty_blocks = 0;
 static uint16_t total_blocks_to_read = 0;
 static uint16_t blocks_to_write = 0;
 static uint16_t write_from_block = 0;
-//static uint8_t resistor_tap_value = 0x80;
+#endif
 static uint16_t adcvalue = 0;
 static unsigned long time_interval_left = 0;
 static uint8_t points_counter = POINTS_TO_BUFFER;
@@ -545,30 +602,21 @@ void loop() {
     pinMode(PIN_PB3, INPUT);
     /* */
     delay(50);
+
     SendSingleLineCommand(3, true);
     SendSingleLineCommand(0xE7);
     SendSingleLineCommand(0xF2);
+
     //
-# if 0     
-    digitalWrite(MCP41011_CS, LOW);
-    delayMicroseconds(1);
-    SPI.transfer16(0x1100+resistor_tap_value);
-    delayMicroseconds(1);
-    digitalWrite(MCP41011_CS, HIGH);
-# endif    
     time_interval_left = millis();
   }
-  /*
+  // Устанавливаем курсор на вторую строку и нулевой символ.
+  lcd.setCursor(0, 1);
+  // Выводим на экран количество секунд с момента запуска ардуины
+  lcd.print(millis()/1000);  /*
    */
-  #if 0
-  while(1) {
-    digitalWrite(MODULE_BUSY_LED, HIGH);
-    delay(500);
-    digitalWrite(MODULE_BUSY_LED, LOW);
-    delay(500);
-  }
-  #endif
   // get current command and check command flag (second byte should be 0)
+#ifdef WITH_PROGRAMMING_POSSIBILITIES  
   non_empty_blocks = 0;
   total_blocks_to_read = 0;
   blocks_to_write = 0;
@@ -635,63 +683,39 @@ void loop() {
           digitalWrite(MEM_CS, HIGH);
           break;
         case 'V' : // set volume level
-          SendSingleLineCommand(0xE0 + datablock[2]);
+          SendSingleLineCommand(WT588_ZERO_VOLUME + datablock[2]);
         break;
         case 'L' : // set loop play
-          SendSingleLineCommand(0xF2);
+          SendSingleLineCommand(WT588_LOOP_PLAY);
         break;
       }
     }
   } else {
     Serial.flush();
   }
+#endif // ifdef  WITH_PROGRAMMING_POSSIBILITIES  
   //
   digitalWrite(MODULE_BUSY_LED, digitalRead(MODULE_BUSY));
   /*
    */
-#if 0
   if (Serial.available()) {
     char cmd = Serial.read();
-    Serial.print("MCP command : "); Serial.print(cmd);
-    switch(cmd) {
+    switch(toupper(cmd)) {
       case 'U' :
         Serial.println("MCP UP");
-        //MCP41011_UP(1);
-        if (255 > resistor_tap_value) {
-          ++resistor_tap_value;
-          Serial.println(resistor_tap_value);
-          digitalWrite(MCP41011_CS, LOW);
-          delayMicroseconds(1);
-          SPI.transfer16(0x1100+resistor_tap_value);
-          delayMicroseconds(1);
-          digitalWrite(MCP41011_CS, HIGH);
-        }
-        else
-         {Serial.print("Taps : "); Serial.println(resistor_tap_value);}
+        MCP4011_UP(1);
         break;
       case 'D' :
         Serial.println("MCP down");
-        //MCP41011_DN(1);
-        if (1 <= resistor_tap_value) {
-          --resistor_tap_value;
-          Serial.println(resistor_tap_value);
-          digitalWrite(MCP41011_CS, LOW);
-          delayMicroseconds(1);
-          SPI.transfer16(0x1100+resistor_tap_value);
-          delayMicroseconds(1);
-          digitalWrite(MCP41011_CS, HIGH);
-        }
-        else
-         {Serial.print("Taps : "); Serial.println(resistor_tap_value);}
+        MCP4011_DN(1);
         break;
     }
   }
-#endif
   /* read voltage and convert to volts
    */
   if (TIMESTEP <= (abs(millis() - time_interval_left))) {
     time_interval_left = millis();
-    adcvalue = analogRead(MCP41011_OUT);
+    adcvalue = analogRead(MONITOR);
     test_output.putValue(adcvalue);
     if (0 == points_counter) {
       points_counter = POINTS_TO_BUFFER;
@@ -707,6 +731,10 @@ void loop() {
   }
 /*
  */
+digitalWrite(MODULE_BUSY_LED, digitalRead(MODULE_BUSY));
+delay(300);
+lcd.print("     ");
+delay(300);
 /*
  */  
 }
