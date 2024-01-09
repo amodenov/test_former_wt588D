@@ -1,5 +1,7 @@
 #include <Arduino.h>
-#include <SPI.h>
+#ifdef WITH_PROGRAMMING_POSSIBILITIES
+#   include <SPI.h>
+#endif
 #include <crc_lib.h>
 #ifdef DISPLAY_TM1637
 #   include <GyverTM1637.h>
@@ -153,8 +155,11 @@ struct FixedAverageBuffer {
 #define WT588_ZERO_VOLUME 0xE0
 /*
  */
-#define BITWEIGHT 31 /* ADC bit weight in millivolts */
+#define BITWEIGHT 49 /* ADC bit weight in tenth of millivolts */
 #define MILLIVOLT_TENTH 10000
+/*
+ */
+#define RECTIFIER_COMPENSATION 3
 /* */
 #ifdef DISPLAY_TM1637
 /*
@@ -168,9 +173,11 @@ LiquidCrystal_I2C lcd(0x27,16,2);
 //#    define WITH_PROGRAMMING_POSSIBILITIES
 /*
  */
+#ifdef WITH_PROGRAMMING_POSSIBILITIES
 static uint8_t test_data_block[DATA_BLOCK_SIZE + 2];
 
 bool SendRecord(uint8_t*);
+#endif
 /*
  *
  */
@@ -219,6 +226,7 @@ void setup() {
   digitalWrite(MODULE_BUSY_LED, HIGH);
   /*
    */
+  #ifdef WITH_PROGRAMMING_POSSIBILITIES
   #ifdef STELLARIS_TIVA 
   SPI.setModule(1);
   #endif
@@ -227,7 +235,7 @@ void setup() {
   SPI.setBitOrder(MSBFIRST);
   SPI.setDataMode(SPI_MODE0);
   SPI.setClockDivider(SPI_CLOCK_DIV16);
-
+  #endif
   /* */
   pinMode(MCP4011_CS, OUTPUT);
   digitalWrite(MCP4011_CS, HIGH);
@@ -459,6 +467,7 @@ void SendSingleLineCommand(uint8_t cmd, bool withreset=false) {
 }
 /*
  */
+#ifdef WITH_PROGRAMMING_POSSIBILITIES
 #define MAX_TIMEOUT 2000
 #define START_OF_RECORD 'S'
 #define READY_TO_GET_RECORD 'R'
@@ -541,6 +550,7 @@ bool SendRecord(uint8_t* buffer) {
   }
   return false;
 }
+#endif
 /*
  */
 void MCP4011_DN(uint8_t steps) {
@@ -574,6 +584,25 @@ void MCP4011_UP(uint8_t steps) {
 }
 /*
  */
+uint16_t GetChannel(uint8_t chn) {
+  uint16_t wADC;
+  ADMUX = chn | _BV(REFS0);
+  ADCSRA |= _BV(ADEN);  // enable the ADC
+
+  delay(20);            // wait for voltages to become stable.
+
+  ADCSRA |= _BV(ADSC);  // Start the ADC
+
+  // Detect end-of-conversion
+  while (bit_is_set(ADCSRA,ADSC));
+
+  // Reading register "ADCW" takes care of how to read ADCL and ADCH.
+  wADC = ADCW;
+
+  return wADC;
+}
+/*
+ */
 # define TIMESTEP 200
 # define POINTS_TO_BUFFER DEFAULT_QUEUE_LENGTH
 FixedAverageBuffer test_output;
@@ -595,7 +624,9 @@ void loop() {
     isFirstEntry = false;
     delay(400);
     //
+#ifdef WITH_PROGRAMMING_POSSIBILITIES    
     SPI.end();
+#endif
     pinMode(MEM_CS, INPUT);
     /* */
     pinMode(PIN_PB5, INPUT);
@@ -603,10 +634,9 @@ void loop() {
     /* */
     delay(50);
 
-    SendSingleLineCommand(3, true);
+    SendSingleLineCommand(8, true);
     SendSingleLineCommand(0xE7);
     SendSingleLineCommand(0xF2);
-
     //
     time_interval_left = millis();
   }
@@ -694,12 +724,11 @@ void loop() {
     Serial.flush();
   }
 #endif // ifdef  WITH_PROGRAMMING_POSSIBILITIES  
-  //
-  digitalWrite(MODULE_BUSY_LED, digitalRead(MODULE_BUSY));
   /*
    */
   if (Serial.available()) {
     char cmd = Serial.read();
+    Serial.print(cmd);
     switch(toupper(cmd)) {
       case 'U' :
         Serial.println("MCP UP");
@@ -713,14 +742,20 @@ void loop() {
   }
   /* read voltage and convert to volts
    */
-  if (TIMESTEP <= (abs(millis() - time_interval_left))) {
+  if (TIMESTEP <= (abs(millis() - time_interval_left))) {    
     time_interval_left = millis();
+    Serial.println(GetChannel(0xE)*BITWEIGHT);
+    Serial.println(GetChannel(0xF)*BITWEIGHT);
     adcvalue = analogRead(MONITOR);
     test_output.putValue(adcvalue);
     if (0 == points_counter) {
       points_counter = POINTS_TO_BUFFER;
       adcvalue = test_output.getValue();
       adcvalue *= BITWEIGHT;
+      adcvalue *= RECTIFIER_COMPENSATION;
+      lcd.setCursor(9, 1);
+      lcd.print(adcvalue/10);
+      lcd.print(" mV");
       uint16_t volts = adcvalue / MILLIVOLT_TENTH;
       uint16_t decimal = adcvalue % MILLIVOLT_TENTH;
       Serial.print("MCP : "); Serial.print(volts);
@@ -732,9 +767,6 @@ void loop() {
 /*
  */
 digitalWrite(MODULE_BUSY_LED, digitalRead(MODULE_BUSY));
-delay(300);
-lcd.print("     ");
-delay(300);
 /*
  */  
 }
