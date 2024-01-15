@@ -8,6 +8,33 @@
 #endif
 #include <LiquidCrystal_I2C.h>
 /*
+ */
+ #include <avr/eeprom.h>
+/*
+ *  The device contains LCD display and three control buttons:
+ *     - "Parameter" (select sample or output voltage control)
+ *     - "Up"
+ *     - "Dn"
+ */
+/*
+ * Samples, preloaded to the WT588D-16P chip
+ *
+ *  Sample #     Data
+ * ------------------------------------------
+ *     0     |    40 Hz
+ *     1     |    80 Hz
+ *     2     |   160 Hz
+ *     3     |   315 Hz
+ *     4     |     1 KHz
+ *     5     |  3.15 KHz
+ *     6     |   6.3 KHz
+ *     7     |    10 KHz
+ *     8     |   40-95 Hz
+ *     9     |  100-155 Hz
+ *    10     |  pseudo noise 400 Hz (not sure)
+ *  --------------------------------------------
+ */
+/*
  *  The code supports WT588D programming capabilities and 
  *  test signal device code
  *    programming capabilities controlled by  #define WITH_PROGRAMMING_POSSIBILITIES
@@ -54,6 +81,13 @@ struct FixedAverageBuffer {
   byte avgpoints;
   uint16_t avgbuffer[DEFAULT_QUEUE_LENGTH];
   byte avglen;
+};
+/*
+ */
+struct DisplayLine {
+  uint8_t x;
+  uint8_t y;
+  const char*   text;
 };
 /*
  */
@@ -121,9 +155,10 @@ struct FixedAverageBuffer {
 # define cs PIN_PB1
 # define ud PIN_PB2
 // device control buttons
-# define PARAM_SELECT PIN_PD3   // PCINT19 
+# define PARAM_SELECT PIN_PD5   // PCINT21 
 # define VALUE_UP     PIN_PD4   // PCINT20
-# define VALUE_DN     PIN_PD5   // PCINT21
+# define VALUE_DN     PIN_PD3   // PCINT19
+# define TDIVIDER 62410 /* 31250 by 3125 to 100 ms */
 #endif
 /*
  */
@@ -155,11 +190,12 @@ struct FixedAverageBuffer {
 #define WT588_ZERO_VOLUME 0xE0
 /*
  */
-#define BITWEIGHT 49 /* ADC bit weight in tenth of millivolts */
 #define MILLIVOLT_TENTH 10000
+#define INTERNAL_1_1V 14  /* Internal 1.1V */
+#define INTERNAL_GND  15  /* Ground channel */
 /*
  */
-#define RECTIFIER_COMPENSATION 3
+#define RECTIFIER_COMPENSATION 3 /* output signal degradation on rectifier */
 /* */
 #ifdef DISPLAY_TM1637
 /*
@@ -167,7 +203,70 @@ struct FixedAverageBuffer {
  */
 GyverTM1637 disp(PIN_PC4, PIN_PC5);
 #endif
+/*
+ * bit weight and bit offset values will be determined during calibration
+ */
+static uint16_t bitweight = 45;
+static uint16_t bitoffset = 0;
+/*
+ */
 LiquidCrystal_I2C lcd(0x27,16,2);
+/*
+ */
+#define TOTAL_SAMPLES 11
+const static char* sample_names[TOTAL_SAMPLES] = {
+"40 Hz",
+"80 Hz",
+"160 Hz",
+"315 Hz",
+"1 KHz",
+"3.15 KHz",
+"6.3 KHz",
+"10 KHz",
+"40-95 Hz",
+"100-155Hz",
+"pn 400 Hz"
+};
+/*
+ */
+DisplayLine msgs[] = {
+  {0, 0, (char*)"Sample:"},
+  {4, 1, (char*)" V : "},
+  {9, 1, NULL}, /* for voltage */
+  {8, 0, NULL}, /* for sample ID */
+  {8, 0, "        "}, /* to delete sample ID */
+  {9, 1, "      "}    /* to delete voltage */
+};
+/*
+ */
+void MCP4011_UP(uint8_t);
+void MCP4011_DN(uint8_t);
+/*
+ */
+void PrintDisplay(uint8_t nmb) {
+  lcd.setCursor(msgs[nmb].x, msgs[nmb].y);
+  lcd.print(msgs[nmb].text);
+}
+/*
+ *
+ */
+enum {
+IDLE = 0, SAMPLE_SET, VOLTAGE_SET
+};
+enum {
+   DN_BUTTON = _BV(VALUE_DN), UP_BUTTON = _BV(VALUE_UP), PARAMETER_BUTTON = _BV(PARAM_SELECT)
+};
+volatile static uint8_t active_button = 0;
+volatile static uint8_t active_button_time = 0;
+volatile static uint8_t delay_time = 0;
+
+static uint8_t device_state = IDLE;
+#define EEPROM_DATA_ENTRY 0
+#define MCP4011_HALF_RANGE 32
+#define MCP4011_FULL_RANGE 63
+static uint8_t current_sample = 0;  /* may be stored in EEPROM */
+static uint8_t  voltage_steps = MCP4011_HALF_RANGE;  /* may be stored in EEPROM, initially set to half of range 
+                                       because it is set to half of range after power on */
 /*
  */
 //#    define WITH_PROGRAMMING_POSSIBILITIES
@@ -179,28 +278,42 @@ static uint8_t test_data_block[DATA_BLOCK_SIZE + 2];
 bool SendRecord(uint8_t*);
 #endif
 /*
- *
- */
-ISR(TIMER0_COMPA_vect) {
-
-}
-/*
  */
 ISR(TIMER1_OVF_vect) {
-
+  TCNT1 = TDIVIDER;
+  if (active_button && (5 > active_button_time)) {
+    ++active_button_time;
+  }
+  if (delay_time) {
+    --delay_time;
+  }
 }
 /*
-  */
+ */
+#define BUTTON_PRESSED_MASK (_BV(PARAM_SELECT) | _BV(VALUE_UP) | _BV(VALUE_DN))
 ISR(PCINT2_vect) {
-  // determine source button
-  if (0 != (PIND & _BV(PARAM_SELECT))) {
-    // process parameter selection button      
-  }
-  if (0 != (PIND & _BV(VALUE_UP))) {
-    // process value up button
-  }
-  if (0 != (PIND & _BV(VALUE_DN))) {
-    // process value dn
+  if (PIND & BUTTON_PRESSED_MASK) {
+    active_button = 0;
+    /* PARAMETER is higher priority button */
+    /* no simultaneous pressed buttons allowed */
+    // determine source button
+    if (0 != (PIND & _BV(PARAM_SELECT))) {
+      // process parameter selection button
+      active_button |= PARAMETER_BUTTON;
+    } else if (0 != (PIND & _BV(VALUE_UP))) {
+      // process value up button
+      active_button |= UP_BUTTON;
+    } else if (0 != (PIND & _BV(VALUE_DN))) {
+      // process value dn
+      active_button |= DN_BUTTON;
+    }
+    active_button_time = 0; /* reset button pressed time in 10 ms ticks */
+  } else {
+    /* button(s) released */
+    active_button &= PIND; /* reset activity if released */
+    if (0 == active_button) {
+      active_button_time = 0;
+    }
   }
 }
 /*
@@ -209,10 +322,11 @@ ISR(PCINT2_vect) {
 void setup() {
   pinMode(MODULE_RESET, OUTPUT);
   digitalWrite(MODULE_RESET, LOW);
+#ifdef WITH_SERIAL_INTERFACE  
   Serial.begin(115200);
-  
   while (!Serial)
     ;  // wait for serial monitor to open
+#endif
 #ifdef WITH_PROGRAMMING_POSSIBILITIES    
   pinMode(MEM_CS, OUTPUT);
   digitalWrite(MEM_CS, HIGH);  // disable memory chip access
@@ -253,16 +367,46 @@ void setup() {
   lcd.init();        
   lcd.init();        
   lcd.backlight();// Включаем подсветку дисплея
-  lcd.setCursor(1, 0);
-  lcd.print("Sample: 100 Hz");
-  lcd.setCursor(9, 1);
-  lcd.print("180 mV");
+  PrintDisplay(0);
+  PrintDisplay(1);
+  /* test and load (if exists) sample number and steps for MCP4010 
+   */
+  current_sample = eeprom_read_byte(EEPROM_DATA_ENTRY);
+  if (10 >= current_sample) {
+    /* looks like there are value in EEPROM */
+    voltage_steps = eeprom_read_byte((uint8_t*)(EEPROM_DATA_ENTRY+1));
+    lcd.setCursor(0, 1);
+    lcd.print(voltage_steps);
+    /* set the MCP4011 resistor to previously saved value */
+    if (MCP4011_HALF_RANGE <= voltage_steps) {
+      MCP4011_UP(voltage_steps-MCP4011_HALF_RANGE);
+    } else {
+      MCP4011_DN(MCP4011_HALF_RANGE - voltage_steps);
+    }
+  } else {
+    current_sample = 0;
+  }
+  /*
+   */
+  msgs[3].text = sample_names[current_sample];
+  PrintDisplay(3);
+  cli();
   /* Prepare for button interrupts
    */
   PCICR |= 4;       // enable PCINT[16-23] interrupts
   PCMSK2 |= _BV(PCINT19) | _BV(PCINT20) | _BV(PCINT21);   // unmask PCINT19, PCINT20, PCINT21 --- button interrupts
+  /*
+  */
+  TCCR1A = TCCR1C = 0;
+  TCCR1B = 4;  /* divide by 256 to 31250 Hz */
+  TCNT1 = TDIVIDER; /* divide to 10 ms */
+  TIMSK1 |= 1;
+  sei();
+  /*
+   * restore previously saved parameters (if exists)
+   */
+  
 }
-
 #ifdef WITH_PROGRAMMING_POSSIBILITIES
 
 void MemorySetAddress(uint32_t devaddr) {
@@ -421,21 +565,6 @@ void SendSingleLineBit(uint8_t b) {
     delayMicroseconds(LONG_STEP);
   }
   digitalWrite(MODULE_DATA, HIGH);
-}
-void SendSingleLineCommand_0(uint8_t cmd) {
-  digitalWrite(MODULE_RESET, LOW);
-  delay(5);
-  digitalWrite(MODULE_RESET, HIGH);
-  /* WAIT 17 ms*/
-  delay(17);
-  /* DATA - 5ms prefix */
-  digitalWrite(MODULE_DATA, LOW);
-  delay(5);
-  digitalWrite(MODULE_DATA, HIGH);
-  for (int i = 0; i < 8; ++i) {
-    SendSingleLineBit(cmd & 1);
-    cmd >>= 1;
-  }
 }
 
 void SendSingleLineCommand(uint8_t cmd, bool withreset=false) {
@@ -603,23 +732,48 @@ uint16_t GetChannel(uint8_t chn) {
 }
 /*
  */
-# define TIMESTEP 200
+# define TIMESTEP 300
 # define POINTS_TO_BUFFER DEFAULT_QUEUE_LENGTH
+# define INTERNAL_REFERENCE_1_1 11000
 FixedAverageBuffer test_output;
+static uint16_t adcvalue = 0;
+/*
+ * Determine bit weight value based on channel 15 - ground and channel 14 - internal reference 1.1 V
+ */
+void DetermineBitWeight(void) {
+  test_output.Init();
+  /* 0V value */
+  for(uint8_t i = 0; i < DEFAULT_QUEUE_LENGTH; ++i) {
+    test_output.putValue(GetChannel(INTERNAL_GND));
+  }
+  adcvalue = test_output.getValue();
+  test_output.Init();
+  /* 1.1 V value */
+  for(uint8_t i = 0; i < DEFAULT_QUEUE_LENGTH; ++i) {
+    test_output.putValue(GetChannel(INTERNAL_1_1V));
+  }
+  bitweight = INTERNAL_REFERENCE_1_1/(test_output.getValue() - adcvalue);
+  bitoffset = adcvalue;
+  Serial.print("\r\nADC koeffs : "); Serial.print(bitweight); Serial.print("   "); Serial.println(bitoffset);
+  test_output.Init();
+}
+/*
+ */
 static bool isFirstEntry = true;
-static uint8_t datablock[DATA_BLOCK_SIZE];
 
 #ifdef WITH_PROGRAMMING_POSSIBILITIES
+static uint8_t datablock[DATA_BLOCK_SIZE];
 static uint16_t non_empty_blocks = 0;
 static uint16_t total_blocks_to_read = 0;
 static uint16_t blocks_to_write = 0;
 static uint16_t write_from_block = 0;
 #endif
-static uint16_t adcvalue = 0;
 static unsigned long time_interval_left = 0;
 static uint8_t points_counter = POINTS_TO_BUFFER;
+static uint8_t display_value = 1;
 void loop() {  
   if (isFirstEntry) {
+    DetermineBitWeight(); /* prepare ADC value koefficients */
     test_output.Init();
     isFirstEntry = false;
     delay(400);
@@ -640,13 +794,8 @@ void loop() {
     //
     time_interval_left = millis();
   }
-  // Устанавливаем курсор на вторую строку и нулевой символ.
-  lcd.setCursor(0, 1);
-  // Выводим на экран количество секунд с момента запуска ардуины
-  lcd.print(millis()/1000);  /*
-   */
-  // get current command and check command flag (second byte should be 0)
 #ifdef WITH_PROGRAMMING_POSSIBILITIES  
+  // get current command and check command flag (second byte should be 0)
   non_empty_blocks = 0;
   total_blocks_to_read = 0;
   blocks_to_write = 0;
@@ -723,8 +872,10 @@ void loop() {
   } else {
     Serial.flush();
   }
-#endif // ifdef  WITH_PROGRAMMING_POSSIBILITIES  
+#endif // ifdef  WITH_PROGRAMMING_POSSIBILITIES
+#ifdef WITH_SERIAL_INTERFACE
   /*
+   * The same actions as for device buttons
    */
   if (Serial.available()) {
     char cmd = Serial.read();
@@ -738,34 +889,136 @@ void loop() {
         Serial.println("MCP down");
         MCP4011_DN(1);
         break;
+      case 'P' :
+        break;
     }
   }
+#endif  
   /* read voltage and convert to volts
    */
-  if (TIMESTEP <= (abs(millis() - time_interval_left))) {    
+  if (TIMESTEP <= (abs(millis() - time_interval_left))) {
     time_interval_left = millis();
-    Serial.println(GetChannel(0xE)*BITWEIGHT);
-    Serial.println(GetChannel(0xF)*BITWEIGHT);
     adcvalue = analogRead(MONITOR);
     test_output.putValue(adcvalue);
     if (0 == points_counter) {
       points_counter = POINTS_TO_BUFFER;
       adcvalue = test_output.getValue();
-      adcvalue *= BITWEIGHT;
-      adcvalue *= RECTIFIER_COMPENSATION;
-      lcd.setCursor(9, 1);
-      lcd.print(adcvalue/10);
-      lcd.print(" mV");
-      uint16_t volts = adcvalue / MILLIVOLT_TENTH;
-      uint16_t decimal = adcvalue % MILLIVOLT_TENTH;
-      Serial.print("MCP : "); Serial.print(volts);
-      sprintf((char*)datablock, "%04d", decimal);
-      Serial.print("."); Serial.println((char*)datablock);
+      adcvalue = adcvalue*bitweight + bitoffset;
+      adcvalue *= RECTIFIER_COMPENSATION; // ? should be investigated
+      if (VOLTAGE_SET != device_state) {
+        lcd.setCursor(9, 1);
+        lcd.print("       ");
+        lcd.setCursor(9, 1);
+        lcd.print(adcvalue/10); /* remove tenth of millivolts */
+        lcd.print("mV");
+      }
     }
     --points_counter;
+  }  
+  /*
+   *
+   */
+  if ((0 != active_button) && (0 == active_button_time)) {
+    if (PARAMETER_BUTTON & active_button) {
+      /* to next device state */
+      if (SAMPLE_SET == device_state) {
+        /* state chnaged from sample set means sample already selected */
+        SendSingleLineCommand(current_sample, true);
+        SendSingleLineCommand(0xE7);
+        SendSingleLineCommand(0xF2);
+        /* save to eeprom */
+        eeprom_write_byte(EEPROM_DATA_ENTRY, current_sample);
+        eeprom_busy_wait();
+        if (eeprom_read_byte(EEPROM_DATA_ENTRY) != current_sample) {
+          lcd.setCursor(0, 1);
+          lcd.print("   ");
+          lcd.setCursor(0, 1);
+          lcd.print("ERR0");
+        }
+      }
+      /* switch form voltage set */
+      if (VOLTAGE_SET == device_state) {
+        /* save to eeprom */
+        eeprom_write_byte((uint8_t*)(EEPROM_DATA_ENTRY+1), voltage_steps);
+        eeprom_busy_wait();
+        if (eeprom_read_byte((uint8_t*)(EEPROM_DATA_ENTRY+1)) != voltage_steps) {
+          lcd.setCursor(0, 1);
+          lcd.print("   ");
+          lcd.setCursor(0, 1);
+          lcd.print("ERR1");
+        }
+      }
+      device_state = (device_state + 1) % 3;
+      if (SAMPLE_SET != device_state) {
+        msgs[3].text = sample_names[current_sample];
+        PrintDisplay(3);
+      }
+    }
+    if (UP_BUTTON & active_button) {
+      if (SAMPLE_SET == device_state) {
+        if ((current_sample+1) < TOTAL_SAMPLES) {
+          ++current_sample;
+          PrintDisplay(4);
+          msgs[3].text = sample_names[current_sample];
+          PrintDisplay(3);
+        }
+      } else if (VOLTAGE_SET == device_state) {
+        MCP4011_UP(1);
+        if (MCP4011_FULL_RANGE > voltage_steps)
+          ++voltage_steps;
+      }
+    }
+    if (DN_BUTTON & active_button) {
+      if (SAMPLE_SET == device_state) {
+        if ((current_sample-1) >= 0) {
+          --current_sample;
+          PrintDisplay(4);
+          msgs[3].text = sample_names[current_sample];
+          PrintDisplay(3);
+        }
+      } else if (VOLTAGE_SET == device_state) {
+        MCP4011_DN(1);
+        if (0 < voltage_steps)
+          --voltage_steps;
+      }
+    }
+    ++active_button_time;
+  }
+  if ((0 != active_button) && (5 == active_button_time)) {
+    /* enter autorepeat mode */
+    
+  }
+  /*
+   * update display according to the mode
+   */
+  if (IDLE != device_state) {
+    if (0 == delay_time) {
+      if (SAMPLE_SET == device_state) {
+        if (display_value) {
+          msgs[3].text = sample_names[current_sample];
+          PrintDisplay(3);
+        } else {
+          PrintDisplay(4);
+        }
+      } else if (VOLTAGE_SET == device_state) {
+        if (display_value) {
+          adcvalue = test_output.getValue();
+          adcvalue = adcvalue*bitweight + bitoffset;
+          adcvalue *= RECTIFIER_COMPENSATION; // ? should be investigated
+          lcd.setCursor(9, 1);
+          lcd.print(adcvalue/10); /* remove tenth of millivolts */
+          lcd.print("mV");
+        } else {
+          lcd.setCursor(9, 1);
+          lcd.print("       ");
+        }
+      }
+      display_value ^= 1;
+      delay_time = 5;
+    }
   }
 /*
- */
+*/
 digitalWrite(MODULE_BUSY_LED, digitalRead(MODULE_BUSY));
 /*
  */  
